@@ -44,6 +44,26 @@ end
 
 As you can see, the workhorse is RSS::Parser#parse, which takes the source of the feed and a parameter that performs validation on the feed. We get back an object that has all of the data from our feed, accessible through methods. This example shows getting the title out of the channel element, and looping through the list of items.
 
+### Streaming entries
+
+Feeds with a very large number of entries don't have to be kept in memory as a whole. `RSS::Parser.each_entry` reads a feed from an IO (or a path, a URI, or an XML string) and yields each entry as soon as it is fully parsed:
+
+```ruby
+require 'rss'
+
+result = RSS::Parser.each_entry(File.open('news.rss')) do |event|
+  case event
+  when RSS::Parser::MetadataEvent
+    puts "Feed: #{event.feed.title}"
+  when RSS::Parser::EntryEvent
+    puts "Entry #{event.index}: #{event.entry.title}"
+  end
+end
+puts "valid: #{result.valid?}"
+```
+
+Yielded entries are detached from their feed, so the parser doesn't keep them in memory; each entry still references its feed through `entry.parent` for inherited metadata. Breaking out of the block stops reading. Note that having received entries doesn't imply the document is valid: required feed elements may be missing or entry IDs may conflict, and that only shows up in the final `RSS::Parser::StreamResult`.
+
 ### Producing RSS
 
 Producing our own RSS feeds is easy as well. Let's make a very basic feed:

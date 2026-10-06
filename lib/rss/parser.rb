@@ -153,8 +153,8 @@ module RSS
       end
     end
 
-    def initialize(rss)
-      @listener = self.class.listener.new
+    def initialize(rss, listener=nil)
+      @listener = listener || self.class.listener.new
       @rss = rss
     end
 
@@ -587,3 +587,5 @@ module RSS
     raise XMLParserNotFound
   end
 end
+
+require_relative "stream"

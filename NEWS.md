@@ -1,5 +1,17 @@
 # News
 
+## Unreleased
+
+### Improvements
+
+  * Added `RSS::Parser.each_entry`, a streaming entry point that
+    reads a feed from an IO and yields each RSS 2.0 item or Atom
+    entry as soon as it is fully parsed, without keeping yielded
+    entries in memory. It reports feed metadata through a metadata
+    event and the final validation result (including missing
+    required elements and conflicting entry IDs) through
+    `RSS::Parser::StreamResult`.
+
 ## 0.3.3 - 2026-06-10
 
 ### Improvements
