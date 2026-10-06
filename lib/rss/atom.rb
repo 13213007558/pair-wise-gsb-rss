@@ -1002,7 +1002,10 @@ module RSS
       @rss.base = attrs["xml:base"]
       @last_element = @rss
       pr = Proc.new do |text, tags|
-        @rss.validate_for_stream(tags) if @do_validate
+        if @do_validate
+          @rss.validate_for_stream(tags)
+          reset_stream_root_validation(@rss) if @stream
+        end
       end
       @proc_stack.push(pr)
     end

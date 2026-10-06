@@ -1,5 +1,6 @@
 # frozen_string_literal: false
 require "forwardable"
+require "stringio"
 require "open-uri"
 
 require_relative "rss"
@@ -50,6 +51,59 @@ module RSS
     end
   end
 
+  # Raised when two Atom entries or RSS 2.0 items use the same ID.
+  class DuplicateEntryIDError < InvalidRSSError
+    attr_reader :id
+
+    def initialize(id)
+      @id = id
+      super("duplicate entry ID: #{id}")
+    end
+  end
+
+  # Represents one event emitted while streaming a feed.
+  #
+  # +type+ is +:entry+, +:metadata+, or +:result+.
+  class StreamEvent
+    attr_reader :type, :entry, :metadata, :result
+
+    def initialize(type, entry: nil, metadata: nil, result: nil)
+      @type = type
+      @entry = entry
+      @metadata = metadata
+      @result = result
+    end
+
+    def entry?
+      @type == :entry
+    end
+
+    def metadata?
+      @type == :metadata
+    end
+
+    def result?
+      @type == :result
+    end
+  end
+
+  # The terminal result of streaming a feed.  Yielding entries or
+  # metadata does not mean that the complete document was valid.
+  class StreamResult
+    attr_reader :metadata, :error
+
+    def initialize(metadata = nil, error = nil)
+      @metadata = metadata
+      @error = error
+    end
+
+    def complete?
+      @error.nil?
+    end
+
+    alias_method(:success?, :complete?)
+  end
+
   class Parser
 
     extend Forwardable
@@ -88,6 +142,39 @@ module RSS
         parser.parse
       end
 
+      # Streams RSS 2.0 and Atom entries and metadata from an IO-like
+      # object, XML string, or file path.  The caller owns an IO passed
+      # directly and is responsible for closing it; opened files are
+      # closed by the parser.
+      def foreach(rss, *args, &block)
+        return to_enum(__method__, rss, *args) unless block
+
+        if args.last.is_a?(Hash)
+          options = args.pop
+        else
+          options = {}
+        end
+        do_validate = boolean_argument(args[0], options[:validate], true)
+        ignore_unknown_element =
+          boolean_argument(args[1], options[:ignore_unknown_element], true)
+        parser_class = args[2] || options[:parser_class] || default_parser
+
+        stream(rss, parser_class, do_validate, ignore_unknown_element, &block)
+      end
+
+      # Yields each complete top-level entry while the feed is read.
+      # Returns the final StreamResult when a block is given.
+      def each_entry(rss, *args, &block)
+        return to_enum(__method__, rss, *args) unless block
+
+        result = nil
+        foreach(rss, *args) do |event|
+          yield(event.entry) if event.entry?
+          result = event.result if event.result?
+        end
+        result
+      end
+
       private
       def boolean_argument(positioned_value, option_value, default)
         value = positioned_value
@@ -98,6 +185,31 @@ module RSS
         value
       end
     end
+
+    def self.stream(rss, parser_class, do_validate, ignore_unknown_element, &block)
+      io = nil
+      own_io = false
+      begin
+        if rss.respond_to?(:read)
+          io = rss
+        elsif rss.is_a?(String) and /</ =~ rss
+          io = StringIO.new(rss)
+          own_io = true
+        elsif rss.is_a?(String) and File.readable?(rss)
+          io = File.open(rss, "rb")
+          own_io = true
+        end
+
+        source = io || allocate.send(:normalize_rss, rss)
+        parser = parser_class.new(source)
+        parser.do_validate = do_validate
+        parser.ignore_unknown_element = ignore_unknown_element
+        parser.stream(&block)
+      ensure
+        io.close if own_io and io.respond_to?(:close)
+      end
+    end
+    private_class_method :stream
 
     def_delegators(:@parser, :parse, :rss,
                    :ignore_unknown_element,
@@ -183,6 +295,19 @@ module RSS
         _parse
       end
       @listener.rss
+    end
+
+    def stream(&block)
+      @listener.start_stream(&block)
+      result = nil
+      begin
+        _parse
+      rescue => error
+        result = @listener.finish_stream_with_error(error)
+      ensure
+        result = @listener.finish_stream unless @listener.stream_finished?
+      end
+      result
     end
 
   end
@@ -287,6 +412,12 @@ module RSS
       @rss = nil
       @ignore_unknown_element = true
       @do_validate = true
+      @stream = nil
+      @stream_finished = false
+      @stream_error = nil
+      @entry_ids = {}
+      @entries_without_author = 0
+      @stream_entry_count = 0
       @ns_stack = [{"xml" => :xml}]
       @tag_stack = [[]]
       @text_stack = ['']
@@ -297,6 +428,48 @@ module RSS
       @xml_child_mode = false
       @xml_element = nil
       @last_xml_element = nil
+    end
+
+    def start_stream(&block)
+      @stream = block
+      @stream_finished = false
+      @stream_error = nil
+      @entry_ids = {}
+      @entries_without_author = 0
+      @stream_entry_count = 0
+    end
+
+    def finish_stream_with_error(error)
+      finish_stream(error)
+    end
+
+    def stream_finished?
+      @stream_finished
+    end
+
+    def finish_stream(error = nil)
+      return if @stream_finished
+
+      metadata = @rss
+      unless error
+        begin
+          validate_stream_metadata(metadata) if metadata and @do_validate
+          validate_stream
+        rescue => validation_error
+          error = validation_error
+        end
+      end
+
+      result = StreamResult.new(metadata, error)
+      @stream_finished = true
+      begin
+        @stream.call(StreamEvent.new(:metadata, :metadata => metadata)) if metadata
+        @stream.call(StreamEvent.new(:result, :result => result))
+      ensure
+        @stream = nil
+        @rss = nil
+      end
+      result
     end
 
     # set instance vars for version, encoding, standalone
@@ -358,6 +531,9 @@ module RSS
       else
         if @rss.nil? and respond_to?("initial_start_#{local}", true)
           __send__("initial_start_#{local}", local, prefix, attrs, ns.dup)
+          if @stream and @rss
+            @rss.define_singleton_method(:validate_for_stream) { |*_tags| }
+          end
         elsif respond_to?("start_#{local}", true)
           __send__("start_#{local}", local, prefix, attrs, ns.dup)
         else
@@ -383,6 +559,99 @@ module RSS
         @last_xml_element << data if @last_xml_element
       else
         @text_stack.last << data
+      end
+    end
+
+    private
+
+    def validate_stream
+      raise @stream_error if @stream_error
+
+      if @do_validate and @rss.respond_to?(:feed_type) and
+          @rss.feed_type == "atom" and @rss.feed_subtype == "feed"
+        @rss.validate_duplicate_links(@rss.links)
+        if @entries_without_author > 0 and
+            !@rss.authors.any? {|author| !author.to_s.empty?}
+          raise MissingTagError.new("author", "feed")
+        end
+      end
+
+    end
+
+    def stream_entry?(element, parent)
+      (element.tag_name == "entry" and parent.equal?(@rss) and
+        @rss.feed_type == "atom" and @rss.feed_subtype == "feed") or
+        (element.tag_name == "item" and
+         (parent.equal?(@rss.channel) rescue false))
+    end
+
+    def emit_stream_entry(element)
+      id = stream_entry_id(element)
+      if id
+        if @entry_ids.has_key?(id)
+          @stream_error ||= DuplicateEntryIDError.new(id)
+        else
+          @entry_ids[id] = true
+        end
+      end
+
+      if atom_stream_entry?(element) and
+          element.instance_variable_get(:@author).all? {|author| author.to_s.empty?}
+        @entries_without_author += 1
+      end
+
+      @stream_entry_count += 1
+      @stream.call(StreamEvent.new(:entry, :entry => element))
+    end
+
+    def atom_stream_entry?(element)
+      element.tag_name == "entry" and element.respond_to?(:parent) and
+        element.parent.equal?(@rss)
+    end
+
+    def stream_feed_has_author?
+      @stream_entry_count > 0 and @entries_without_author == 0
+    end
+
+    def stream_entry_id(element)
+      if element.tag_name == "entry"
+        element.id && element.id.content
+      elsif element.tag_name == "item"
+        element.guid && element.guid.content
+      end
+    end
+
+    def validate_stream_metadata(metadata)
+      if metadata.respond_to?(:feed_type) and metadata.feed_type == "atom" and
+          metadata.feed_subtype == "feed"
+        metadata.define_singleton_method(:have_author?) { true }
+        begin
+          metadata.validate(@ignore_unknown_element)
+        ensure
+          metadata.define_singleton_method(:have_author?) do |check_parent=true|
+            original = metadata.class.instance_method(:have_author?)
+            original.bind_call(metadata, check_parent)
+          end
+        end
+      else
+        metadata.validate(@ignore_unknown_element)
+      end
+    end
+
+    def reset_stream_root_validation(metadata)
+      return unless metadata.singleton_class.method_defined?(:validate_for_stream)
+
+      original = metadata.class.instance_method(:validate_for_stream)
+      metadata.define_singleton_method(:validate_for_stream) do |tags, ignore_unknown_element|
+        original.bind_call(metadata, tags, ignore_unknown_element)
+      end
+    end
+
+    def remove_stream_entry(element, parent)
+      if element.tag_name == "entry"
+        parent.entries.pop
+      elsif element.tag_name == "item"
+        parent.items.pop
       end
     end
 
@@ -551,7 +820,11 @@ module RSS
           end
         end
         if @do_validate
-          @last_element.validate_for_stream(tags, @ignore_unknown_element)
+          validate_element_for_stream(@last_element, tags)
+        end
+        if @stream and stream_entry?(@last_element, previous)
+          remove_stream_entry(@last_element, previous)
+          emit_stream_entry(@last_element)
         end
         @last_element = previous
       end
@@ -560,6 +833,16 @@ module RSS
     def setup_next_element_in_unknown_element
       current_element, @last_element = @last_element, nil
       Proc.new {@last_element = current_element}
+    end
+
+    def validate_element_for_stream(element, tags)
+      element.validate_for_stream(tags, @ignore_unknown_element)
+      if element.tag_name == "entry" and element.respond_to?(:parent) and
+          element.parent.equal?(@rss)
+        element.__send__(:children).each do |child|
+          child.validate(@ignore_unknown_element)
+        end
+      end
     end
   end
 
