@@ -17,10 +17,16 @@ module RSS
 
     URI = "http://www.w3.org/2005/Atom"
 
-    ##
     # The XHTML URI W3C Namespace
 
     XHTML_URI = "http://www.w3.org/1999/xhtml"
+
+    ##
+    # The Atom Tombstone namespace
+    #
+    # Reference: https://www.rfc-editor.org/rfc/rfc6721
+
+    TOMBSTONE_URI = "http://purl.org/atompub/tombstones/1.0"
 
     module CommonModel
       NSPOOL = {}
@@ -43,6 +49,30 @@ module RSS
             end
 
             # Returns true
+            def need_parent?
+              true
+            end
+          end
+        end
+      end
+    end
+
+    module TombstoneCommonModel
+      def self.append_features(klass)
+        super
+        klass.install_must_call_validator("at", TOMBSTONE_URI)
+        [
+         ["lang", :xml],
+         ["base", :xml],
+        ].each do |name, uri, required|
+          klass.install_get_attribute(name, uri, required, [nil, :inherit])
+        end
+        klass.class_eval do
+          class << self
+            def required_uri
+              TOMBSTONE_URI
+            end
+
             def need_parent?
               true
             end
@@ -288,6 +318,7 @@ module RSS
       include DuplicateLinkChecker
 
       install_ns('', URI)
+      install_ns('at', TOMBSTONE_URI)
 
       [
        ["author", "*", :children],
@@ -308,6 +339,8 @@ module RSS
         __send__("install_have_#{type}_element",
                  tag, URI, occurs, tag, *args)
       end
+      install_have_children_element("deleted-entry", TOMBSTONE_URI, "*",
+                                    "deleted_entry", "deleted_entries")
 
       # Creates a new Atom feed
       def initialize(version=nil, encoding=nil, standalone=nil)
@@ -326,6 +359,11 @@ module RSS
       end
 
       private
+      def initialize_have_children_elements
+        super
+        @deleted_entries ||= []
+      end
+
       def atom_validate(ignore_unknown_element, tags, uri)
         unless have_author?
           raise MissingTagError.new("author", tag_name)
@@ -522,6 +560,100 @@ module RSS
       class Updated < RSS::Element
         include CommonModel
         include DateConstruct
+      end
+
+      # Describes an Entry that has been deleted.
+      #
+      # Reference: https://www.rfc-editor.org/rfc/rfc6721.html#rfc.section.3
+      class DeletedEntry < RSS::Element
+        include TombstoneCommonModel
+
+        self::NSPOOL = Feed::NSPOOL.dup
+
+        [
+         ["ref", "", true],
+         ["when", "", true, :w3cdtf],
+        ].each do |name, uri, required, type|
+          install_get_attribute(name, uri, required, type)
+        end
+
+        install_have_child_element("by", TOMBSTONE_URI, "?", "by")
+        install_have_child_element("comment", TOMBSTONE_URI, "?",
+                                   "comment", :content)
+
+        add_need_initialize_variable("extensions")
+        add_need_initialize_variable("extension_attributes")
+        add_to_element_method("extensions_element")
+        attr_accessor :extensions
+        attr_accessor :extension_attributes
+
+        def initialize(*args)
+          super
+          @extensions ||= []
+          @extension_attributes ||= {}
+        end
+
+        def full_name
+          "at:deleted-entry"
+        end
+
+        def maker_target(channel)
+          channel.new_deleted_entry
+        end
+
+        private
+        def extensions_element(need_convert=true, indent='')
+          @extensions.collect do |extension|
+            extension.to_s
+          end.join("\n")
+        end
+
+        def additional_attrs
+          super.merge(@extension_attributes || {})
+        end
+
+        def __validate(ignore_unknown_element, tags=_tags, recursive=true)
+          if recursive
+            children.compact.each do |child|
+              child.validate(ignore_unknown_element)
+            end
+          end
+
+          grouped_tags = tag_filter(tags.dup)
+          _validate(ignore_unknown_element,
+                     grouped_tags[TOMBSTONE_URI],
+                     TOMBSTONE_URI)
+
+          unless ignore_unknown_element
+            grouped_tags.each do |tag_uri, names|
+              next if tag_uri == TOMBSTONE_URI
+              name = names.first
+              raise NotExpectedTagError.new(name, tag_uri, tag_name)
+            end
+          end
+        end
+
+        class By < RSS::Element
+          include TombstoneCommonModel
+          include PersonConstruct
+
+          def full_name
+            "at:by"
+          end
+
+          def maker_target(target)
+            target.by {|by| by}
+          end
+        end
+
+        class Comment < RSS::Element
+          include TombstoneCommonModel
+          include ContentModel
+
+          def full_name
+            "at:comment"
+          end
+        end
       end
 
       # Defines a child Atom Entry element of an Atom Feed element.
@@ -1020,6 +1152,22 @@ module RSS
         @rss.validate_for_stream(tags) if @do_validate
       end
       @proc_stack.push(pr)
+    end
+  end
+end
+require_relative "atom/incremental_feed"
+
+module RSS
+  module Atom
+    class << self
+      def merge_incremental_feed(state, feed, *positional_policy,
+                                same_timestamp: :keep_existing, &policy)
+        IncrementalFeed.merge(state,
+                              feed,
+                              *positional_policy,
+                              same_timestamp: same_timestamp,
+                              &policy)
+      end
     end
   end
 end

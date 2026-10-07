@@ -24,6 +24,8 @@ module RSS
 
         class Channel < ChannelBase
           include SetupDefaultLanguage
+          include AtomDeletedEntries
+          def_classed_element("deleted_entries")
 
           def to_feed(feed)
             set_default_values do

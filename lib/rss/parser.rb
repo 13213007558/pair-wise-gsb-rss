@@ -297,6 +297,7 @@ module RSS
       @xml_child_mode = false
       @xml_element = nil
       @last_xml_element = nil
+      @deleted_entry_extension_stack = []
     end
 
     # set instance vars for version, encoding, standalone
@@ -355,6 +356,9 @@ module RSS
           end
         end
         @proc_stack.push(pr)
+      elsif @last_element.is_a?(RSS::Atom::Feed::DeletedEntry) &&
+          _ns(ns, prefix) != RSS::Atom::TOMBSTONE_URI
+        start_deleted_entry_extension(local, prefix, attrs, ns)
       else
         if @rss.nil? and respond_to?("initial_start_#{local}", true)
           __send__("initial_start_#{local}", local, prefix, attrs, ns.dup)
@@ -422,6 +426,32 @@ module RSS
       end
     end
 
+    def start_deleted_entry_extension(local, prefix, attrs, ns)
+      element_attrs = attrs.dup
+      ns.each do |ns_prefix, value|
+        next if ns_prefix == "xml"
+        key = ns_prefix.empty? ? "xmlns" : "xmlns:#{ns_prefix}"
+        element_attrs[key] ||= value
+      end
+      root = XML::Element.new(local,
+                             prefix.empty? ? nil : prefix,
+                             _ns(ns, prefix),
+                             element_attrs)
+      @deleted_entry_extension_stack.push([root, @last_element])
+      @last_xml_element = root
+      @xml_child_mode = true
+
+      pr = Proc.new do |text, tags|
+        extension, previous_element = @deleted_entry_extension_stack.pop
+        previous_element.extensions << extension
+        @last_element = previous_element
+        @last_xml_element = nil
+        @xml_element = nil
+        @xml_child_mode = false
+      end
+      @proc_stack.push(pr)
+    end
+
     if Module.method(:const_defined?).arity == -1
       def known_class?(target_class, class_name)
         class_name and
@@ -486,6 +516,16 @@ module RSS
     def start_have_something_element(tag_name, prefix, attrs, ns, klass)
       if check_ns(tag_name, prefix, ns, klass.required_uri)
         attributes = collect_attributes(tag_name, prefix, attrs, ns, klass)
+        if klass <= RSS::Atom::Feed::DeletedEntry
+          extension_attributes = {}
+          attrs.each do |name, value|
+            local_name = name.include?(":") ? name.split(":", 2).last : name
+            extension_attributes[name] = value unless klass.get_attributes.any? do |a_name,|
+              a_name == local_name
+            end
+          end
+          attributes["extension_attributes"] = extension_attributes
+        end
         @proc_stack.push(setup_next_element(tag_name, klass, attributes))
       else
         @proc_stack.push(setup_next_element_in_unknown_element)

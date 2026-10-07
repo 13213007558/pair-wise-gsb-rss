@@ -169,5 +169,82 @@ EOC
         %w(uri)
       end
     end
+
+    module AtomDeletedEntries
+      class DeletedEntries < Base
+        def_array_element("deleted_entry", "deleted_entries")
+
+        class DeletedEntry < Base
+          %w(ref when).each do |attribute|
+            attr_accessor attribute
+            add_need_initialize_variable(attribute)
+          end
+
+          def_classed_element("by")
+          def_classed_element("comment", nil, "content")
+          attr_accessor :extensions, :extension_attributes
+          add_need_initialize_variable("extensions") { [] }
+          add_need_initialize_variable("extension_attributes") { {} }
+
+          def to_feed(feed, current)
+            deleted_entry = current.class::DeletedEntry.new
+            deleted_entry.ref = ref
+            deleted_entry.when = self.when
+            deleted_entry.extensions.replace(extensions)
+            deleted_entry.extension_attributes.replace(extension_attributes)
+            setup_other_elements(feed, deleted_entry)
+            current.deleted_entries << deleted_entry
+            set_parent(deleted_entry, current)
+            unless have_required_values?
+              raise NotSetError.new("maker.channel.deleted_entry",
+                                    not_set_required_variables)
+            end
+          end
+
+          private
+          def required_variable_names
+            %w(ref when)
+          end
+
+          class By < Base
+            include AtomPersonConstructBase
+
+            def to_feed(feed, current)
+              by = current.class::By.new
+              setup_values(by)
+              current.by = by
+              set_parent(by, current)
+              setup_other_elements(feed, by)
+            end
+
+            private
+            def required_variable_names
+              %w(name)
+            end
+          end
+
+          class Comment < Base
+            include AtomTextConstructBase
+
+            def to_feed(feed, current)
+              comment = current.class::Comment.new
+              if setup_values(comment)
+                current.comment = comment
+                set_parent(comment, current)
+                setup_other_elements(feed, comment)
+              elsif variable_is_set?
+                raise NotSetError.new("maker.channel.deleted_entry.comment",
+                                      not_set_required_variables)
+              end
+            end
+
+            private
+            def required_variable_names
+              []
+            end
+          end
+        end
+      end
+    end
   end
 end
