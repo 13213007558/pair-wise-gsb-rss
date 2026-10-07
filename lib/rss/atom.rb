@@ -22,6 +22,12 @@ module RSS
 
     XHTML_URI = "http://www.w3.org/1999/xhtml"
 
+    ##
+    # The namespace used by the Atom tombstone extension defined in
+    # RFC 6721.
+
+    TOMBSTONE_URI = "http://purl.org/atompub/tombstones/1.0"
+
     module CommonModel
       NSPOOL = {}
       ELEMENTS = []
@@ -260,6 +266,32 @@ module RSS
       end
     end
 
+    module TombstoneModel
+      NSPOOL = {
+        "at" => TOMBSTONE_URI,
+        "atom" => URI,
+      }
+
+      def self.append_features(klass)
+        super
+        klass.install_must_call_validator("at", TOMBSTONE_URI)
+        [
+         ["lang", :xml],
+         ["base", :xml],
+        ].each do |name, uri, required|
+          klass.install_get_attribute(name, uri, required, [nil, :inherit])
+        end
+        klass.class_eval do
+          class << self
+
+            def need_parent?
+              true
+            end
+          end
+        end
+      end
+    end
+
     # Defines the top-level element of an Atom Feed Document.
     # It consists of a number of children Entry elements,
     # and has the following attributes:
@@ -308,15 +340,36 @@ module RSS
         __send__("install_have_#{type}_element",
                  tag, URI, occurs, tag, *args)
       end
+      add_have_children_element("at_deleted_entry", "at_deleted_entries")
+      add_plural_form("at_deleted_entry", "at_deleted_entries")
+      add_to_element_method("at_deleted_entries_element")
+      module_eval do
+        def at_deleted_entries_element(need_convert=true, indent='')
+          @at_deleted_entries.collect do |deleted_entry|
+            deleted_entry.to_s(need_convert, indent)
+          end.join("\n")
+        end
+        private :at_deleted_entries_element
+      end
 
       # Creates a new Atom feed
       def initialize(version=nil, encoding=nil, standalone=nil)
         super("1.0", version, encoding, standalone)
         @feed_type = "atom"
         @feed_subtype = "feed"
+        @at_deleted_entries ||= []
       end
 
+      attr_accessor :seen_tombstone
+
       alias_method :items, :entries
+      def deleted_entry
+        @at_deleted_entries.first
+      end
+
+      def deleted_entries
+        @at_deleted_entries
+      end
 
       # Returns true if there are any authors for the feed or any of the Entry
       # child elements have an author
@@ -326,6 +379,31 @@ module RSS
       end
 
       private
+      def _validate(ignore_unknown_element, tags, uri, models=self.class.models)
+        return super unless uri == URI and seen_tombstone
+        atom_models = models.find_all {|_, model_uri| model_uri == uri}
+        model_names = atom_models.collect {|name,| name}
+        atom_tags = Array(tags).reject do |tag|
+          tag_name = tag.is_a?(Array) ? tag.last : tag
+          tag_name == "deleted-entry"
+        end
+        atom_tags = atom_tags.collect do |tag|
+          tag.is_a?(Array) ? tag.last : tag
+        end
+        atom_tags = atom_tags.sort_by do |name|
+          model_names.index(name) || model_names.size
+        end
+        return if atom_tags.empty?
+      end
+
+      def ns_declarations
+        declarations = super
+        if deleted_entries.any?
+          declarations["xmlns:at"] = TOMBSTONE_URI
+        end
+        declarations
+      end
+
       def atom_validate(ignore_unknown_element, tags, uri)
         unless have_author?
           raise MissingTagError.new("author", tag_name)
@@ -522,6 +600,178 @@ module RSS
       class Updated < RSS::Element
         include CommonModel
         include DateConstruct
+      end
+
+      # A tombstone that records the deletion of the Atom Entry identified
+      # by the +ref+ attribute.
+      #
+      # Reference: RFC 6721 section 3
+      class TombstoneEntry < RSS::Element
+        include TombstoneModel
+
+        install_get_attribute("ref", "", true, [nil, :uri])
+        # +when+ is defined explicitly below so a Time value passed by
+        # the maker does not get parsed again.
+
+        install_have_child_element("by", TOMBSTONE_URI, "?", "at_by")
+        install_have_child_element("comment", TOMBSTONE_URI, "?",
+                                   "at_comment")
+        add_to_element_method("at_extensions_element")
+
+        attr_accessor :extensions, :extension_attributes,
+                      :extension_namespaces
+        attr_reader :when_attribute_missing
+        attr_reader :when
+
+        def initialize(*args)
+          super
+          @extensions ||= []
+          @extension_attributes ||= {}
+          @extension_namespaces ||= {}
+        end
+
+        def full_name
+          "at:deleted-entry"
+        end
+
+        def by
+          @at_by
+        end
+
+        def comment
+          @at_comment
+        end
+
+        def by=(value)
+          @at_by = value
+          @at_by.parent = self unless value.nil?
+        end
+
+        def comment=(value)
+          @at_comment = value
+          @at_comment.parent = self unless value.nil?
+        end
+
+        def converter=(converter)
+          super
+          by.converter = converter unless by.nil?
+          comment.converter = converter unless comment.nil?
+        end
+
+        def at_extensions_element(need_convert=true, indent='')
+          extensions.collect do |extension|
+            "#{indent}#{extension}"
+          end.join("\n")
+        end
+
+        def collect_attrs
+          attributes = super
+          return nil if attributes.nil?
+          attributes["when"] = @when&.w3cdtf unless @when.nil?
+          attributes.update(extension_namespaces)
+          attributes.update(extension_attributes)
+          attributes
+        end
+
+        def when=(value)
+          @when_attribute_missing = value.nil? or value.to_s.empty?
+          @when =
+            if value.class.name.start_with?("Time", "DateTime")
+              value
+            elsif @when_attribute_missing
+              nil
+            else
+              begin
+                Time.w3cdtf(value)
+              rescue ArgumentError
+                Time.parse(value)
+              end
+            end
+        end
+
+        def at_validate(ignore_unknown_element, tags, uri)
+          if self.when.nil?
+            raise MissingAttributeError.new(tag_name, "when")
+          end
+          known_tags = Array(tags).find_all do |tag_uri, tag_name|
+            tag_uri == TOMBSTONE_URI and ["by", "comment"].include?(tag_name)
+          end
+          _validate(ignore_unknown_element, known_tags, TOMBSTONE_URI)
+        end
+
+        private
+
+        # The entity responsible for deleting an entry.
+        class By < Feed::Author
+          class << self
+            def required_prefix
+              nil
+            end
+
+            def required_uri
+              TOMBSTONE_URI
+            end
+          end
+
+          def full_name
+            standalone_tombstone? ? "by" : "at:by"
+          end
+
+          def standalone_tombstone?
+            parent.is_a?(Atom::DeletedEntry)
+          end
+
+          def self.need_parent?
+            true
+          end
+
+          alias_method :atom_name, :name
+          alias_method :atom_uri, :uri
+          alias_method :atom_email, :email
+          alias_method :name_element_without_tombstone,
+                       :name_element
+          alias_method :uri_element_without_tombstone,
+                       :uri_element
+          alias_method :email_element_without_tombstone,
+                       :email_element
+
+          def name_element(need_convert=true, indent='')
+            value = name_element_without_tombstone(need_convert, indent)
+            return value unless standalone_tombstone?
+            value.sub("<name", "<atom:name")
+              .sub("</name>", "</atom:name>")
+          end
+
+          def uri_element(need_convert=true, indent='')
+            value = uri_element_without_tombstone(need_convert, indent)
+            return value unless standalone_tombstone?
+            value.sub("<uri", "<atom:uri")
+              .sub("</uri>", "</atom:uri>")
+          end
+
+          def email_element(need_convert=true, indent='')
+            value = email_element_without_tombstone(need_convert, indent)
+            return value unless standalone_tombstone?
+            value.sub("<email", "<atom:email")
+              .sub("</email>", "</atom:email>")
+          end
+        end
+
+        # A human-readable explanation of why the entry was deleted.
+        class Comment < RSS::Element
+          include TombstoneModel
+          include ContentModel
+
+          class << self
+            def required_prefix
+              nil
+            end
+          end
+
+          def full_name
+            parent.is_a?(Atom::DeletedEntry) ? "comment" : "at:comment"
+          end
+        end
       end
 
       # Defines a child Atom Entry element of an Atom Feed element.
@@ -984,6 +1234,28 @@ module RSS
       # Feed::Entry::Updated
       Updated = Feed::Entry::Updated
     end
+
+    # Defines a top-level Atom tombstone document.
+    #
+    # Reference: RFC 6721 section 3
+    class DeletedEntry < Feed::TombstoneEntry
+      include RootElementMixin
+
+      NSPOOL = {
+        "" => TOMBSTONE_URI,
+        "atom" => URI,
+      }
+
+      def initialize(version=nil, encoding=nil, standalone=nil)
+        super("1.0", version, encoding, standalone)
+        @feed_type = "atom"
+        @feed_subtype = "deleted-entry"
+      end
+
+      def full_name
+        "deleted-entry"
+      end
+    end
   end
 
   Atom::CommonModel::ELEMENTS.each do |name|
@@ -991,6 +1263,46 @@ module RSS
   end
 
   module ListenerMixin
+    alias_method :start_else_element_without_tombstone, :start_else_element
+    alias_method :tag_start_without_tombstone, :tag_start
+
+    public
+    def tag_start(name, attributes)
+      ns = @ns_stack.last.dup
+      attrs = {}
+      attributes.each do |attribute_name, value|
+        if /\Axmlns(?:\z|:)/ =~ attribute_name
+          ns[$POSTMATCH] = value
+        else
+          attrs[attribute_name] = value
+        end
+      end
+
+      prefix, local = split_name(name)
+      previous_element = @last_element
+      if previous_element.nil? and local == "deleted-entry" and
+          _ns(ns, prefix) == Atom::TOMBSTONE_URI
+        @text_stack.push('')
+        @ns_stack.push(ns)
+        @tag_stack.last.push([_ns(ns, prefix), local])
+        @tag_stack.push([])
+        initial_start_deleted_entry(local, prefix, attrs, ns.dup)
+        return
+      end
+      tag_start_without_tombstone(name, attributes)
+      if !@xml_child_mode and local == "deleted-entry" and
+          _ns(ns, prefix) == Atom::TOMBSTONE_URI and
+          (previous_element.nil? or previous_element.is_a?(Atom::Feed))
+        if previous_element.nil?
+          initialize_tombstone_attributes(@rss, attrs, ns)
+        else
+          replace_unknown_tombstone(local, prefix, attrs, ns,
+                                    previous_element)
+          previous_element.seen_tombstone = true
+        end
+      end
+    end
+
     private
     def initial_start_feed(tag_name, prefix, attrs, ns)
       check_ns(tag_name, prefix, ns, Atom::URI, false)
@@ -1021,5 +1333,179 @@ module RSS
       end
       @proc_stack.push(pr)
     end
+
+    def initial_start_deleted_entry(tag_name, prefix, attrs, ns)
+      check_ns(tag_name, prefix, ns, Atom::TOMBSTONE_URI, false)
+
+      allow_missing_when = attrs["when"]&.to_s&.empty?
+      @rss = Atom::DeletedEntry.new(@version, @encoding, @standalone)
+      if attrs.key?("when")
+        @rss.instance_variable_set(:@when, allow_missing_when ? nil :
+                                   Time.w3cdtf(attrs["when"]))
+        @rss.instance_variable_set(:@when_attribute_missing,
+                                   allow_missing_when)
+      end
+      @rss.do_validate = @do_validate
+      @rss.xml_stylesheets = @xml_stylesheets
+      @rss.lang = attrs["xml:lang"]
+      @rss.base = attrs["xml:base"]
+      @last_element = @rss
+      initialize_tombstone_attributes(@rss, attrs, ns)
+      pr = Proc.new do |text, tags|
+        @rss.validate_for_stream(tags) if
+          @do_validate and !allow_missing_when
+      end
+      @proc_stack.push(pr)
+    end
+
+    def start_else_element(local, prefix, attrs, ns)
+      known_tombstone_children = %w(by comment)
+      if @last_element.is_a?(Atom::Feed::TombstoneEntry) and
+          not (known_tombstone_children.include?(local) and
+               [Atom::TOMBSTONE_URI, Atom::URI].include?(_ns(ns, prefix)))
+        start_tombstone_extension_element(local, prefix, attrs, ns)
+      else
+        start_else_element_without_tombstone(local, prefix, attrs, ns)
+      end
+    end
+
+    def start_by(local, prefix, attrs, ns)
+      if @last_element.is_a?(Atom::Feed::TombstoneEntry) and
+          _ns(ns, prefix) == Atom::TOMBSTONE_URI
+        start_tombstone_named_child(local, prefix, attrs, ns,
+                                    Atom::Feed::TombstoneEntry::By, :@at_by)
+      else
+        start_else_element_without_tombstone(local, prefix, attrs, ns)
+      end
+    end
+
+    def start_comment(local, prefix, attrs, ns)
+      if @last_element.is_a?(Atom::Feed::TombstoneEntry) and
+          _ns(ns, prefix) == Atom::TOMBSTONE_URI
+        start_tombstone_named_child(local, prefix, attrs, ns,
+                                    Atom::Feed::TombstoneEntry::Comment,
+                                    :@at_comment)
+      else
+        start_else_element_without_tombstone(local, prefix, attrs, ns)
+      end
+    end
+
+    private
+    def start_tombstone_named_child(tag_name, prefix, attrs, ns, klass,
+                                    variable_name)
+      if check_ns(tag_name, prefix, ns, Atom::TOMBSTONE_URI, false)
+        previous = @last_element
+        child = klass.new(@do_validate,
+                          collect_attributes(tag_name, prefix, attrs, ns,
+                                            klass))
+        previous.instance_variable_set(variable_name, child)
+        child.parent = previous
+        @last_element = child
+        @xml_child_mode = child.have_xml_content?
+
+        Proc.new do |text, tags|
+          child.content = text if klass.have_content?
+          child.validate_for_stream(tags, @ignore_unknown_element) if
+            @do_validate
+          @last_element = previous
+        end.tap do |callback|
+          @proc_stack.push(callback)
+        end
+      else
+        @proc_stack.push(setup_next_element_in_unknown_element)
+      end
+    end
+
+      def replace_unknown_tombstone(tag_name, prefix, attrs, ns, parent)
+        @proc_stack.pop
+        parent.seen_tombstone = true
+        deleted_entry_class = Atom::Feed::TombstoneEntry
+        allow_missing_when = attrs["when"]&.to_s&.empty?
+        attributes = collect_attributes(tag_name, prefix, attrs, ns,
+                                       deleted_entry_class)
+        deleted_entry = deleted_entry_class.allocate
+        deleted_entry.send(:initialize, @do_validate, attributes)
+        if allow_missing_when
+          deleted_entry.instance_variable_set(:@when, nil)
+          deleted_entry.instance_variable_set(:@when_attribute_missing, true)
+        else
+          deleted_entry.when = attrs["when"]
+          deleted_entry.instance_variable_set(:@when_attribute_missing,
+                                             false)
+        end
+        initialize_tombstone_attributes(deleted_entry, attrs, ns)
+        parent.deleted_entries << deleted_entry
+        @last_element = deleted_entry
+        deleted_entry.parent = parent
+
+        Proc.new do |text, tags|
+          if @do_validate and !allow_missing_when
+            deleted_entry.validate_for_stream(tags,
+                                             @ignore_unknown_element)
+          end
+          @last_element = parent
+        end.tap do |callback|
+          @proc_stack.push(callback)
+        end
+      end
+
+      def initialize_tombstone_attributes(deleted_entry, attrs, ns)
+        known_attributes = ["ref", "when", "xml:lang", "xml:base"]
+        deleted_entry.ref = attrs["ref"] if attrs.key?("ref")
+        deleted_entry.instance_variable_set(:@when_attribute_missing,
+                                           attrs["when"].to_s.empty?)
+        deleted_entry.extension_attributes =
+          attrs.reject {|name,| known_attributes.include?(name)}
+        deleted_entry.extension_namespaces = ns.reject do |namespace_prefix, uri|
+          namespace_prefix == "xml" or
+            (namespace_prefix.empty? and
+              [Atom::URI, Atom::TOMBSTONE_URI].include?(uri)) or
+            (namespace_prefix == "at" and
+              uri == Atom::TOMBSTONE_URI) or
+            (namespace_prefix == "atom" and uri == Atom::URI)
+        end.each_with_object({}) do |(namespace_prefix, uri), namespaces|
+          name = namespace_prefix.empty? ? "xmlns" :
+            "xmlns:#{namespace_prefix}"
+          namespaces[name] = uri
+        end
+      end
+
+      def remove_blank_extension_text(element)
+        element.children.reject! do |child|
+          child.is_a?(String) and child.strip.empty?
+        end
+        element.children.each do |child|
+          remove_blank_extension_text(child) if child.is_a?(XML::Element)
+        end
+      end
+
+      def start_tombstone_extension_element(local, prefix, attrs, ns)
+        previous = @last_element
+        element_attrs = attrs.dup
+        ns.each do |namespace_prefix, uri|
+          next if namespace_prefix == "xml"
+          next if namespace_prefix.empty? and uri == Atom::URI
+          next if namespace_prefix == "at" and
+            uri == Atom::TOMBSTONE_URI
+          key = namespace_prefix.empty? ? "xmlns" :
+            "xmlns:#{namespace_prefix}"
+          element_attrs[key] ||= uri
+        end
+        extension = XML::Element.new(local,
+                                    prefix.empty? ? nil : prefix,
+                                    _ns(ns, prefix),
+                                    element_attrs)
+        previous.extensions << extension
+        @last_xml_element = extension
+        @xml_child_mode = true
+
+        Proc.new do
+          remove_blank_extension_text(extension)
+          @last_xml_element = nil
+          @xml_element = nil
+          @xml_child_mode = false
+          @last_element = previous
+        end
+      end
   end
 end

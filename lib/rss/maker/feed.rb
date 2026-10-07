@@ -24,6 +24,7 @@ module RSS
 
         class Channel < ChannelBase
           include SetupDefaultLanguage
+          def_classed_element("deleted_entries", "DeletedEntries")
 
           def to_feed(feed)
             set_default_values do
@@ -142,6 +143,90 @@ module RSS
                                                     "Description")
           AtomTextConstruct.def_atom_text_construct(self, "title",
                                                     "maker.channel.title")
+
+          class DeletedEntries < Base
+            def_array_element("deleted_entry", "deleted_entries")
+
+            class DeletedEntry < Base
+              %w(ref when).each do |attribute|
+                attr_accessor attribute
+                add_need_initialize_variable(attribute)
+              end
+              def_other_element_without_accessor("by")
+              def_other_element("comment")
+              def_other_element("extensions")
+              def_other_element("extension_attributes")
+              def_other_element("extension_namespaces")
+
+              def initialize(*args)
+                super
+                @by = By.new(@maker)
+                @comment = nil
+                @extensions = []
+                @extension_attributes ||= {}
+                @extension_namespaces ||= {}
+              end
+
+              def to_feed(feed, current=feed)
+                return unless have_required_values?
+                deleted_entry = feed.class::TombstoneEntry.new
+                deleted_entry.ref = ref
+                deleted_entry.when = self.when
+                by.to_feed(feed, deleted_entry) unless by.nil?
+                unless comment.nil?
+                  comment_model = deleted_entry.class::Comment.new
+                  comment_model.content = comment
+                  deleted_entry.comment = comment_model
+                end
+                deleted_entry.extensions.replace(extensions.to_a)
+                deleted_entry.extension_attributes.update(extension_attributes)
+                deleted_entry.extension_namespaces.update(extension_namespaces)
+                feed.deleted_entries << deleted_entry
+                set_parent(deleted_entry, feed)
+              end
+
+              def by
+                block_given? ? yield(@by) : @by
+              end
+
+              private
+              def required_variable_names
+                %w(ref when)
+              end
+
+              class By < Base
+                %w(name uri email).each do |attribute|
+                  attr_accessor attribute
+                  add_need_initialize_variable(attribute)
+                end
+
+                def to_feed(feed, current)
+                  by = current.class::By.new
+                  %w[name uri email].each do |attribute|
+                    value = __send__(attribute)
+                    next if value.nil?
+                    child = by.class.const_get(Utils.to_class_name(attribute)).new
+                    child.content = value
+                    by.__send__("#{attribute}=", child)
+                  end
+                  current.by = by
+                  set_parent(by, current)
+                end
+              end
+
+              class Comment < Base
+                attr_accessor :content
+                add_need_initialize_variable(:content)
+
+                def to_feed(feed, current)
+                  comment = current.class::Comment.new
+                  comment.content = content
+                  current.comment = comment
+                  set_parent(comment, current)
+                end
+              end
+            end
+          end
         end
 
         class Image < ImageBase
